@@ -1,24 +1,15 @@
 #!/usr/bin/env bash
 #
 # Cloudflare DNS Management Script
-# Helper script for common DNS operations
+# Helper script for common DNS operations — JSON output for AI consumption.
 #
 # Usage:
 #   ./cloudflare-dns.sh <command> [args]
 #
-# Commands:
-#   list-zones                     List all zones
-#   list-records [zone_id]         List DNS records for a zone
-#   get-record <zone_id> <name>    Get specific record by name
-#   create-a <zone_id> <name> <ip> [proxied]    Create A record
-#   create-cname <zone_id> <name> <target> [proxied]  Create CNAME
-#   delete-record <zone_id> <record_id>  Delete record
-#   export <zone_id>               Export zone to BIND format
-#   verify-token                   Verify API token validity
-#
-# Environment Variables:
-#   CF_API_TOKEN - Cloudflare API Token (required)
-#   CF_ZONE_ID   - Default zone ID (optional)
+# Output Convention:
+#   Success → stdout JSON: {"status": "ok", ...}
+#   Error   → stderr JSON: {"error": "code", "hint": "...", "recoverable": true|false}
+#   Exit codes: 0 = success, 1 = recoverable, 2 = fatal
 #
 
 set -euo pipefail
@@ -31,27 +22,51 @@ if [[ -f "$SKILL_DIR/.env" ]]; then
     set +a
 fi
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
-
 # Cloudflare API base URL
 CF_API="https://api.cloudflare.com/client/v4"
 
-# Check required environment
+# ─── Output helpers ───
+
+json_ok() {
+    # Usage: json_ok '{"results": [...]}' "hint message"
+    local data="$1"
+    local hint="${2:-}"
+    if [[ -n "$hint" ]]; then
+        echo "$data" | jq --arg h "$hint" '. + {status: "ok", hint: $h}'
+    else
+        echo "$data" | jq '. + {status: "ok"}'
+    fi
+}
+
+json_error() {
+    # Usage: json_error "error_code" "hint message" [recoverable=true]
+    local code="$1"
+    local hint="$2"
+    local recoverable="${3:-true}"
+    cat >&2 <<EOF
+{"error": "$code", "hint": "$hint", "recoverable": $recoverable}
+EOF
+}
+
+# ─── Checks ───
+
 check_token() {
     if [[ -z "${CF_API_TOKEN:-}" ]]; then
-        echo -e "${RED}Error: CF_API_TOKEN environment variable not set${NC}" >&2
-        echo "Export your Cloudflare API token:" >&2
-        echo "  export CF_API_TOKEN='your-api-token'" >&2
+        json_error "missing_token" "CF_API_TOKEN not set. Create one at https://dash.cloudflare.com/profile/api-tokens with Zone:Read + DNS:Edit permissions." true
         exit 1
     fi
 }
 
-# API request helper
+check_zone_id() {
+    local zone_id="${1:-}"
+    if [[ -z "$zone_id" ]]; then
+        json_error "missing_zone_id" "Zone ID required. Pass as argument or set CF_ZONE_ID environment variable." true
+        exit 1
+    fi
+}
+
+# ─── API request helper ───
+
 cf_api() {
     local method="$1"
     local endpoint="$2"
@@ -68,73 +83,108 @@ cf_api() {
     curl "${args[@]}" "${CF_API}${endpoint}"
 }
 
-# Print formatted output
-print_success() { echo -e "${GREEN}✓${NC} $1"; }
-print_error() { echo -e "${RED}✗${NC} $1" >&2; }
-print_info() { echo -e "${BLUE}ℹ${NC} $1"; }
-print_warn() { echo -e "${YELLOW}⚠${NC} $1" >&2; }
+# Check if Cloudflare API response was successful
+cf_check_success() {
+    local result="$1"
+    echo "$result" | jq -e '.success == true' > /dev/null 2>&1
+}
 
-# Verify API token
+# ─── Commands ───
+
 cmd_verify_token() {
     check_token
-    echo "Verifying API token..."
 
+    local result
     result=$(cf_api GET "/user/tokens/verify")
 
-    if echo "$result" | jq -e '.success == true' > /dev/null 2>&1; then
-        print_success "Token is valid"
-        echo "$result" | jq -r '.result | "  Status: \(.status)\n  Expires: \(.expires_on // "Never")"'
+    if cf_check_success "$result"; then
+        local status expires
+        status=$(echo "$result" | jq -r '.result.status')
+        expires=$(echo "$result" | jq -r '.result.expires_on // "never"')
+        json_ok "{\"token_status\": \"$status\", \"expires\": \"$expires\"}" "Token is valid (status: $status, expires: $expires)"
     else
-        print_error "Token verification failed"
-        echo "$result" | jq -r '.errors[] | "  Error: \(.message)"'
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "token_invalid" "Token verification failed: $msg" true
         exit 1
     fi
 }
 
-# List all zones
 cmd_list_zones() {
     check_token
-    echo "Listing zones..."
 
-    cf_api GET "/zones?per_page=50" | jq -r '.result[] | "\(.name)\t\(.id)\t\(.status)"' | \
-        column -t -s $'\t' -N "ZONE,ID,STATUS"
+    local result
+    result=$(cf_api GET "/zones?per_page=50")
+
+    if cf_check_success "$result"; then
+        local count
+        count=$(echo "$result" | jq '.result | length')
+        echo "$result" | jq --arg h "$count zone(s) found" '{
+            status: "ok",
+            hint: $h,
+            results: [.result[] | {name, id, status}]
+        }'
+    else
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "api_error" "Failed to list zones: $msg" true
+        exit 1
+    fi
 }
 
-# List DNS records
 cmd_list_records() {
     check_token
     local zone_id="${1:-${CF_ZONE_ID:-}}"
+    check_zone_id "$zone_id"
 
-    if [[ -z "$zone_id" ]]; then
-        echo -e "${RED}Error: Zone ID required${NC}"
-        echo "Usage: $0 list-records <zone_id>"
-        echo "  Or set CF_ZONE_ID environment variable"
+    local result
+    result=$(cf_api GET "/zones/$zone_id/dns_records?per_page=5000")
+
+    if cf_check_success "$result"; then
+        local count
+        count=$(echo "$result" | jq '.result | length')
+        echo "$result" | jq --arg h "$count record(s) found" '{
+            status: "ok",
+            hint: $h,
+            results: [.result[] | {type, name, content, proxied, ttl, id}]
+        }'
+    else
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "api_error" "Failed to list records: $msg" true
         exit 1
     fi
-
-    echo "Listing DNS records for zone: $zone_id"
-
-    cf_api GET "/zones/$zone_id/dns_records?per_page=5000" | \
-        jq -r '.result[] | "\(.type)\t\(.name)\t\(.content)\t\(.proxied)\t\(.ttl)"' | \
-        column -t -s $'\t' -N "TYPE,NAME,CONTENT,PROXIED,TTL"
 }
 
-# Get specific record
 cmd_get_record() {
     check_token
     local zone_id="${1:-}"
     local name="${2:-}"
 
     if [[ -z "$zone_id" || -z "$name" ]]; then
-        echo -e "${RED}Error: Zone ID and record name required${NC}"
-        echo "Usage: $0 get-record <zone_id> <name>"
+        json_error "missing_args" "Zone ID and record name required. Usage: get-record <zone_id> <name>" true
         exit 1
     fi
 
-    cf_api GET "/zones/$zone_id/dns_records?name=$name" | jq '.result[]'
+    local result
+    result=$(cf_api GET "/zones/$zone_id/dns_records?name=$name")
+
+    if cf_check_success "$result"; then
+        local count
+        count=$(echo "$result" | jq '.result | length')
+        echo "$result" | jq --arg h "$count record(s) matching '$name'" '{
+            status: "ok",
+            hint: $h,
+            results: [.result[] | {type, name, content, proxied, ttl, id}]
+        }'
+    else
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "api_error" "Failed to get record: $msg" true
+        exit 1
+    fi
 }
 
-# Create A record
 cmd_create_a() {
     check_token
     local zone_id="${1:-}"
@@ -143,13 +193,11 @@ cmd_create_a() {
     local proxied="${4:-true}"
 
     if [[ -z "$zone_id" || -z "$name" || -z "$ip" ]]; then
-        echo -e "${RED}Error: Zone ID, name, and IP required${NC}"
-        echo "Usage: $0 create-a <zone_id> <name> <ip> [proxied]"
+        json_error "missing_args" "Zone ID, name, and IP required. Usage: create-a <zone_id> <name> <ip> [proxied]" true
         exit 1
     fi
 
-    echo "Creating A record: $name -> $ip (proxied: $proxied)"
-
+    local result
     result=$(cf_api POST "/zones/$zone_id/dns_records" "{
         \"type\": \"A\",
         \"name\": \"$name\",
@@ -158,17 +206,20 @@ cmd_create_a() {
         \"proxied\": $proxied
     }")
 
-    if echo "$result" | jq -e '.success == true' > /dev/null 2>&1; then
-        print_success "A record created"
-        echo "$result" | jq -r '.result | "  ID: \(.id)\n  Name: \(.name)\n  Content: \(.content)"'
+    if cf_check_success "$result"; then
+        echo "$result" | jq '{
+            status: "ok",
+            hint: "A record created",
+            record: {id: .result.id, name: .result.name, content: .result.content, proxied: .result.proxied}
+        }'
     else
-        print_error "Failed to create record"
-        echo "$result" | jq -r '.errors[] | "  Error: \(.message)"'
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "create_failed" "Failed to create A record: $msg" true
         exit 1
     fi
 }
 
-# Create CNAME record
 cmd_create_cname() {
     check_token
     local zone_id="${1:-}"
@@ -177,13 +228,11 @@ cmd_create_cname() {
     local proxied="${4:-true}"
 
     if [[ -z "$zone_id" || -z "$name" || -z "$target" ]]; then
-        echo -e "${RED}Error: Zone ID, name, and target required${NC}"
-        echo "Usage: $0 create-cname <zone_id> <name> <target> [proxied]"
+        json_error "missing_args" "Zone ID, name, and target required. Usage: create-cname <zone_id> <name> <target> [proxied]" true
         exit 1
     fi
 
-    echo "Creating CNAME record: $name -> $target (proxied: $proxied)"
-
+    local result
     result=$(cf_api POST "/zones/$zone_id/dns_records" "{
         \"type\": \"CNAME\",
         \"name\": \"$name\",
@@ -192,209 +241,206 @@ cmd_create_cname() {
         \"proxied\": $proxied
     }")
 
-    if echo "$result" | jq -e '.success == true' > /dev/null 2>&1; then
-        print_success "CNAME record created"
-        echo "$result" | jq -r '.result | "  ID: \(.id)\n  Name: \(.name)\n  Content: \(.content)"'
+    if cf_check_success "$result"; then
+        echo "$result" | jq '{
+            status: "ok",
+            hint: "CNAME record created",
+            record: {id: .result.id, name: .result.name, content: .result.content, proxied: .result.proxied}
+        }'
     else
-        print_error "Failed to create record"
-        echo "$result" | jq -r '.errors[] | "  Error: \(.message)"'
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "create_failed" "Failed to create CNAME record: $msg" true
         exit 1
     fi
 }
 
-# Delete record
 cmd_delete_record() {
     check_token
     local zone_id="${1:-}"
     local record_id="${2:-}"
 
     if [[ -z "$zone_id" || -z "$record_id" ]]; then
-        echo -e "${RED}Error: Zone ID and record ID required${NC}"
-        echo "Usage: $0 delete-record <zone_id> <record_id>"
+        json_error "missing_args" "Zone ID and record ID required. Usage: delete-record <zone_id> <record_id>" true
         exit 1
     fi
 
-    echo "Deleting record: $record_id"
-
+    local result
     result=$(cf_api DELETE "/zones/$zone_id/dns_records/$record_id")
 
-    if echo "$result" | jq -e '.success == true' > /dev/null 2>&1; then
-        print_success "Record deleted"
+    if cf_check_success "$result"; then
+        json_ok "{\"deleted_id\": \"$record_id\"}" "Record $record_id deleted"
     else
-        print_error "Failed to delete record"
-        echo "$result" | jq -r '.errors[] | "  Error: \(.message)"'
+        local msg
+        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+        json_error "delete_failed" "Failed to delete record: $msg" true
         exit 1
     fi
 }
 
-# Export zone
 cmd_export() {
     check_token
     local zone_id="${1:-${CF_ZONE_ID:-}}"
-
-    if [[ -z "$zone_id" ]]; then
-        echo -e "${RED}Error: Zone ID required${NC}"
-        echo "Usage: $0 export <zone_id>"
-        exit 1
-    fi
+    check_zone_id "$zone_id"
 
     local filename="zone-export-$(date +%Y%m%d-%H%M%S).txt"
-    echo "Exporting zone $zone_id to $filename..."
 
     cf_api GET "/zones/$zone_id/dns_records/export" > "$filename"
 
     if [[ -s "$filename" ]]; then
-        print_success "Zone exported to $filename"
-        echo "  Records: $(grep -c '^[^;]' "$filename" || echo 0)"
+        local count
+        count=$(grep -c '^[^;]' "$filename" || echo 0)
+        json_ok "{\"file\": \"$filename\", \"record_count\": $count}" "Zone exported to $filename ($count records)"
     else
-        print_error "Export failed or zone is empty"
+        rm -f "$filename"
+        json_error "export_failed" "Export failed or zone is empty" true
         exit 1
     fi
 }
 
-# Check External-DNS in Kubernetes
 cmd_check_external_dns() {
-    echo "Checking External-DNS status..."
+    local pods_ok=false logs=""
 
-    # Check pods
-    echo -e "\n${BLUE}Pods:${NC}"
-    kubectl get pods -n external-dns -o wide 2>/dev/null || print_warn "Cannot access external-dns namespace"
+    if command -v kubectl &>/dev/null; then
+        if kubectl get pods -n external-dns -o json &>/dev/null; then
+            pods_ok=true
+            local pod_info
+            pod_info=$(kubectl get pods -n external-dns -o json | jq '[.items[] | {name: .metadata.name, status: .status.phase, ready: (.status.containerStatuses[0].ready // false)}]')
+            local error_lines
+            error_lines=$(kubectl logs -n external-dns deployment/external-dns --tail=100 2>/dev/null | grep -i error || true)
 
-    # Check recent logs
-    echo -e "\n${BLUE}Recent logs:${NC}"
-    kubectl logs -n external-dns deployment/external-dns --tail=20 2>/dev/null || print_warn "Cannot access logs"
-
-    # Check for errors
-    echo -e "\n${BLUE}Errors (last 100 lines):${NC}"
-    kubectl logs -n external-dns deployment/external-dns --tail=100 2>/dev/null | grep -i error || print_success "No errors found"
+            cat <<EOF | jq '.'
+{
+    "status": "ok",
+    "hint": "External-DNS status retrieved",
+    "pods": $pod_info,
+    "recent_errors": $(echo "$error_lines" | jq -R -s 'split("\n") | map(select(. != ""))')
+}
+EOF
+        else
+            json_error "k8s_access" "Cannot access external-dns namespace. Check kubectl context and permissions." true
+            exit 1
+        fi
+    else
+        json_error "missing_kubectl" "kubectl not found. Install kubectl to use Kubernetes features." false
+        exit 2
+    fi
 }
 
-# DNS verification
 cmd_verify_dns() {
     local hostname="${1:-}"
 
     if [[ -z "$hostname" ]]; then
-        echo -e "${RED}Error: Hostname required${NC}"
-        echo "Usage: $0 verify-dns <hostname>"
+        json_error "missing_args" "Hostname required. Usage: verify-dns <hostname>" true
         exit 1
     fi
 
-    echo "Verifying DNS for: $hostname"
+    if ! command -v dig &>/dev/null; then
+        json_error "missing_dig" "dig not found. Install bind-utils or dnsutils." false
+        exit 2
+    fi
 
-    echo -e "\n${BLUE}A Record (via Cloudflare 1.1.1.1):${NC}"
-    dig @1.1.1.1 "$hostname" A +short
+    local a_records aaaa_records txt_records ip proxy_status
 
-    echo -e "\n${BLUE}AAAA Record:${NC}"
-    dig @1.1.1.1 "$hostname" AAAA +short
+    a_records=$(dig @1.1.1.1 "$hostname" A +short | jq -R -s 'split("\n") | map(select(. != ""))')
+    aaaa_records=$(dig @1.1.1.1 "$hostname" AAAA +short | jq -R -s 'split("\n") | map(select(. != ""))')
+    txt_records=$(dig @1.1.1.1 "_externaldns.$hostname" TXT +short | jq -R -s 'split("\n") | map(select(. != ""))')
 
-    echo -e "\n${BLUE}TXT Ownership Record:${NC}"
-    dig @1.1.1.1 "_externaldns.$hostname" TXT +short
-
-    echo -e "\n${BLUE}Proxy Status:${NC}"
     ip=$(dig +short "$hostname" | head -1)
     if [[ "$ip" =~ ^104\.|^172\.64\.|^141\.101\. ]]; then
-        print_success "Proxied through Cloudflare (IP: $ip)"
+        proxy_status="proxied"
+    elif [[ -n "$ip" ]]; then
+        proxy_status="dns_only"
     else
-        print_info "DNS-only / Direct (IP: $ip)"
+        proxy_status="unresolved"
     fi
+
+    cat <<EOF | jq '.'
+{
+    "status": "ok",
+    "hint": "DNS verification for $hostname (proxy: $proxy_status)",
+    "hostname": "$hostname",
+    "a_records": $a_records,
+    "aaaa_records": $aaaa_records,
+    "txt_ownership": $txt_records,
+    "proxy_status": "$proxy_status",
+    "resolved_ip": "$ip"
+}
+EOF
 }
 
-# Preflight check
 cmd_preflight() {
     local ready=true
-    local deps="{}"
-    local creds="{}"
 
     # Check dependencies
-    local has_curl=false has_jq=false has_dig=false
-    command -v curl &>/dev/null && has_curl=true
-    command -v jq &>/dev/null && has_jq=true
-    command -v dig &>/dev/null && has_dig=true
+    local curl_ok=false jq_ok=false dig_ok=false kubectl_ok=false
+    command -v curl &>/dev/null && curl_ok=true
+    command -v jq &>/dev/null && jq_ok=true
+    command -v dig &>/dev/null && dig_ok=true
+    command -v kubectl &>/dev/null && kubectl_ok=true
 
-    if ! $has_curl || ! $has_jq; then ready=false; fi
-
-    deps=$(cat <<DEPS
-{"curl": $has_curl, "jq": $has_jq, "dig": $has_dig}
-DEPS
-)
+    if ! $curl_ok || ! $jq_ok; then ready=false; fi
 
     # Check credentials
-    local has_token=false has_zone=false token_valid=false
-    [[ -n "${CF_API_TOKEN:-}" ]] && has_token=true
-    [[ -n "${CF_ZONE_ID:-}" ]] && has_zone=true
-
-    if $has_token && $has_curl; then
-        local verify
-        verify=$(curl -s -X GET "${CF_API}/user/tokens/verify" \
-            -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null)
-        if echo "$verify" | jq -e '.success == true' &>/dev/null; then
-            token_valid=true
-        else
-            ready=false
+    local token_status="not_configured" zone_status="not_configured" token_valid=false
+    if [[ -n "${CF_API_TOKEN:-}" ]]; then
+        token_status="configured"
+        if $curl_ok && $jq_ok; then
+            local verify
+            verify=$(curl -s -X GET "${CF_API}/user/tokens/verify" \
+                -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null)
+            if echo "$verify" | jq -e '.success == true' &>/dev/null; then
+                token_valid=true
+            else
+                ready=false
+                token_status="invalid"
+            fi
         fi
     else
         ready=false
     fi
 
-    creds=$(cat <<CREDS
-{"CF_API_TOKEN": $has_token, "CF_ZONE_ID": $has_zone, "token_valid": $token_valid}
-CREDS
-)
+    [[ -n "${CF_ZONE_ID:-}" ]] && zone_status="configured"
 
-    # Output JSON
-    cat <<JSON
-{"ready": $ready, "dependencies": $deps, "credentials": $creds}
-JSON
+    cat <<EOF | jq '.'
+{
+    "ready": $ready,
+    "dependencies": {
+        "curl": {"status": "$(if $curl_ok; then echo ok; else echo missing; fi)", "hint": "brew install curl"},
+        "jq": {"status": "$(if $jq_ok; then echo ok; else echo missing; fi)", "hint": "brew install jq"},
+        "dig": {"status": "$(if $dig_ok; then echo ok; else echo missing; fi)", "hint": "brew install bind (optional, for DNS verification)"},
+        "kubectl": {"status": "$(if $kubectl_ok; then echo ok; else echo missing; fi)", "hint": "brew install kubectl (optional, for External-DNS)"}
+    },
+    "credentials": {
+        "CF_API_TOKEN": {"status": "$token_status", "valid": $token_valid, "required": true, "hint": "Create at https://dash.cloudflare.com/profile/api-tokens with Zone:Read + DNS:Edit"},
+        "CF_ZONE_ID": {"status": "$zone_status", "required": false, "hint": "Find in Cloudflare dashboard → zone overview (right sidebar)"}
+    },
+    "hint": "$(if $ready; then echo 'All checks passed, ready to use'; else echo 'Some checks failed, see details above'; fi)"
+}
+EOF
 
     if ! $ready; then exit 1; fi
 }
 
-# Show help
 cmd_help() {
-    cat << 'EOF'
-Cloudflare DNS Management Script
-
-Usage:
-  ./cloudflare-dns.sh <command> [arguments]
-
-Commands:
-  verify-token                         Verify API token validity
-  list-zones                           List all zones
-  list-records [zone_id]               List DNS records
-  get-record <zone_id> <name>          Get specific record
-  create-a <zone_id> <name> <ip> [proxied]        Create A record
-  create-cname <zone_id> <name> <target> [proxied] Create CNAME
-  delete-record <zone_id> <record_id>  Delete record
-  export <zone_id>                     Export zone to BIND format
-  check-external-dns                   Check External-DNS in Kubernetes
-  verify-dns <hostname>                Verify DNS resolution
-
-Environment Variables:
-  CF_API_TOKEN  Cloudflare API Token (required)
-  CF_ZONE_ID    Default zone ID (optional)
-
-Examples:
-  # Set up environment
-  export CF_API_TOKEN='your-token-here'
-  export CF_ZONE_ID='your-zone-id'
-
-  # Verify token
-  ./cloudflare-dns.sh verify-token
-
-  # List zones
-  ./cloudflare-dns.sh list-zones
-
-  # List records
-  ./cloudflare-dns.sh list-records
-
-  # Create proxied A record
-  ./cloudflare-dns.sh create-a $CF_ZONE_ID app 20.185.100.50 true
-
-  # Create DNS-only A record (for mail)
-  ./cloudflare-dns.sh create-a $CF_ZONE_ID mail 20.185.100.51 false
-
-  # Verify DNS
-  ./cloudflare-dns.sh verify-dns app.example.com
+    cat <<EOF | jq '.'
+{
+    "status": "ok",
+    "hint": "Available commands listed below",
+    "commands": [
+        {"name": "preflight", "args": "", "description": "Check environment readiness"},
+        {"name": "verify-token", "args": "", "description": "Verify API token validity"},
+        {"name": "list-zones", "args": "", "description": "List all zones"},
+        {"name": "list-records", "args": "[zone_id]", "description": "List DNS records for a zone"},
+        {"name": "get-record", "args": "<zone_id> <name>", "description": "Get specific record by name"},
+        {"name": "create-a", "args": "<zone_id> <name> <ip> [proxied]", "description": "Create A record"},
+        {"name": "create-cname", "args": "<zone_id> <name> <target> [proxied]", "description": "Create CNAME record"},
+        {"name": "delete-record", "args": "<zone_id> <record_id>", "description": "Delete record"},
+        {"name": "export", "args": "<zone_id>", "description": "Export zone to BIND format"},
+        {"name": "check-external-dns", "args": "", "description": "Check External-DNS in Kubernetes"},
+        {"name": "verify-dns", "args": "<hostname>", "description": "Verify DNS resolution"}
+    ]
+}
 EOF
 }
 
@@ -404,21 +450,20 @@ main() {
     shift || true
 
     case "$command" in
-        preflight)         cmd_preflight "$@" ;;
-        verify-token)      cmd_verify_token "$@" ;;
-        list-zones)        cmd_list_zones "$@" ;;
-        list-records)      cmd_list_records "$@" ;;
-        get-record)        cmd_get_record "$@" ;;
-        create-a)          cmd_create_a "$@" ;;
-        create-cname)      cmd_create_cname "$@" ;;
-        delete-record)     cmd_delete_record "$@" ;;
-        export)            cmd_export "$@" ;;
-        check-external-dns) cmd_check_external_dns "$@" ;;
-        verify-dns)        cmd_verify_dns "$@" ;;
-        help|--help|-h)    cmd_help ;;
+        preflight)           cmd_preflight "$@" ;;
+        verify-token)        cmd_verify_token "$@" ;;
+        list-zones)          cmd_list_zones "$@" ;;
+        list-records)        cmd_list_records "$@" ;;
+        get-record)          cmd_get_record "$@" ;;
+        create-a)            cmd_create_a "$@" ;;
+        create-cname)        cmd_create_cname "$@" ;;
+        delete-record)       cmd_delete_record "$@" ;;
+        export)              cmd_export "$@" ;;
+        check-external-dns)  cmd_check_external_dns "$@" ;;
+        verify-dns)          cmd_verify_dns "$@" ;;
+        help|--help|-h)      cmd_help ;;
         *)
-            echo -e "${RED}Unknown command: $command${NC}"
-            echo "Run '$0 help' for usage"
+            json_error "unknown_command" "Unknown command: $command. Run with 'help' for usage." true
             exit 1
             ;;
     esac
