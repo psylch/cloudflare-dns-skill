@@ -94,14 +94,16 @@ cf_check_success() {
 cmd_verify_token() {
     check_token
 
+    # Test actual capability (list zones) instead of meta-verify endpoint,
+    # because /user/tokens/verify only works for User-level tokens,
+    # not Account-level tokens.
     local result
-    result=$(cf_api GET "/user/tokens/verify")
+    result=$(cf_api GET "/zones?per_page=1")
 
     if cf_check_success "$result"; then
-        local status expires
-        status=$(echo "$result" | jq -r '.result.status')
-        expires=$(echo "$result" | jq -r '.result.expires_on // "never"')
-        json_ok "{\"token_status\": \"$status\", \"expires\": \"$expires\"}" "Token is valid (status: $status, expires: $expires)"
+        local zone_count
+        zone_count=$(echo "$result" | jq '.result_info.total_count // 0')
+        json_ok "{\"token_status\": \"active\", \"accessible_zones\": $zone_count}" "Token is valid ($zone_count zone(s) accessible)"
     else
         local msg
         msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
@@ -386,9 +388,11 @@ cmd_preflight() {
     if [[ -n "${CF_API_TOKEN:-}" ]]; then
         token_status="configured"
         if $curl_ok && $jq_ok; then
+            # Test actual capability (list zones) instead of meta-verify endpoint
             local verify
-            verify=$(curl -s -X GET "${CF_API}/user/tokens/verify" \
-                -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null)
+            verify=$(curl -s -X GET "${CF_API}/zones?per_page=1" \
+                -H "Authorization: Bearer $CF_API_TOKEN" \
+                -H "Content-Type: application/json" 2>/dev/null)
             if echo "$verify" | jq -e '.success == true' &>/dev/null; then
                 token_valid=true
             else
