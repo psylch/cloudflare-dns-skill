@@ -1,0 +1,20 @@
+{
+  "name": "psylch-cloudflare-dns-skill",
+  "owner": {
+    "name": "psylch"
+  },
+  "metadata": {
+    "description": "Manage Cloudflare DNS records via REST API with Azure and Kubernetes integration."
+  },
+  "plugins": [
+    {
+      "name": "cloudflare-dns",
+      "source": "./",
+      "description": "Manage Cloudflare DNS records via REST API — record CRUD, proxy settings, zone export, DNS verification, and Kubernetes External-DNS integration.",
+      "version": "1.0.0",
+      "category": "developer-tools",
+      "tags": ["cloudflare", "dns", "infrastructure", "kubernetes", "azure"],
+      "homepage": "https://github.com/psylch/cloudflare-dns-skill"
+    }
+  ]
+}

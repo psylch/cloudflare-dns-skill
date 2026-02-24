@@ -1,0 +1,12 @@
+{
+  "name": "cloudflare-dns",
+  "description": "Manage Cloudflare DNS records via REST API — record CRUD, proxy settings, zone export, DNS verification, and Kubernetes External-DNS integration.",
+  "version": "1.0.0",
+  "author": {
+    "name": "psylch"
+  },
+  "homepage": "https://github.com/psylch/cloudflare-dns-skill",
+  "repository": "https://github.com/psylch/cloudflare-dns-skill",
+  "license": "MIT",
+  "keywords": ["cloudflare", "dns", "infrastructure", "kubernetes", "azure"]
+}
