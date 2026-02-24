@@ -5,44 +5,75 @@ description: Comprehensive guide for managing Cloudflare DNS with Azure integrat
 
 # Cloudflare DNS Skill
 
+## Language
+
+**Match user's language**: Respond in the same language the user uses.
+
+## Overview
+
 Manage Cloudflare DNS records via REST API. Covers record CRUD, proxy settings, troubleshooting, and Kubernetes External-DNS integration.
+
+## Script Directory
+
+Determine this SKILL.md directory as `SKILL_DIR`, then use `${SKILL_DIR}/scripts/cloudflare-dns.sh`.
 
 ## Environment
 
-Credentials are stored in `.env` at the skill root (`~/.claude/skills/cloudflare-dns/.env`). The helper script auto-loads this file. For inline `curl` commands, source it first:
-
-```bash
-set -a; source ~/.claude/skills/cloudflare-dns/.env; set +a
-```
+Credentials are loaded automatically from `.env` at the skill root. The script checks in this order:
+1. Environment variables (already set in shell)
+2. `${SKILL_DIR}/.env` (auto-loaded by script)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `CF_API_TOKEN` | Yes | Cloudflare API Token (Zone:Read + DNS:Edit) |
 | `CF_ZONE_ID` | No | Default zone ID (avoids passing it to every command) |
 
-Create a token at: Cloudflare Dashboard > My Profile > API Tokens > Custom token with `Zone:Read` + `DNS:Edit` permissions, scoped to specific zones.
+### First-time Setup
+
+When running preflight and credentials are missing, guide the user:
+
+```
+Cloudflare API credentials not found.
+
+How to obtain:
+1. Visit https://dash.cloudflare.com/profile/api-tokens
+2. Create Custom Token with permissions: Zone:Read + DNS:Edit
+3. Scope to specific zones (recommended)
+4. Copy the token
+
+Where to save?
+A) Project-level: <cwd>/.env (this project only)
+B) User-level: ${SKILL_DIR}/.env (all projects using this skill)
+```
+
+After the user chooses, write the `.env` file:
+```
+CF_API_TOKEN=<user_input>
+CF_ZONE_ID=<user_input_optional>
+```
 
 ## Workflow
 
-1. **Preflight** — Verify credentials and tools are ready:
+1. **Preflight** — Verify credentials and tools:
    ```bash
-   bash ~/.claude/skills/cloudflare-dns/scripts/cloudflare-dns.sh preflight
+   bash ${SKILL_DIR}/scripts/cloudflare-dns.sh preflight
    ```
-2. **List existing records** — Understand current state before making changes:
+   If `ready: false`, follow the First-time Setup above.
+2. **List existing records** — Understand current state before changes:
    ```bash
-   bash ~/.claude/skills/cloudflare-dns/scripts/cloudflare-dns.sh list-records
+   bash ${SKILL_DIR}/scripts/cloudflare-dns.sh list-records
    ```
 3. **Create / update / delete** records as needed:
    ```bash
-   bash ~/.claude/skills/cloudflare-dns/scripts/cloudflare-dns.sh create-cname $CF_ZONE_ID www target.example.com true
-   bash ~/.claude/skills/cloudflare-dns/scripts/cloudflare-dns.sh create-a $CF_ZONE_ID app 1.2.3.4 true
+   bash ${SKILL_DIR}/scripts/cloudflare-dns.sh create-cname $CF_ZONE_ID www target.example.com true
+   bash ${SKILL_DIR}/scripts/cloudflare-dns.sh create-a $CF_ZONE_ID app 1.2.3.4 true
    ```
 4. **Verify DNS propagation**:
    ```bash
-   bash ~/.claude/skills/cloudflare-dns/scripts/cloudflare-dns.sh verify-dns app.example.com
+   bash ${SKILL_DIR}/scripts/cloudflare-dns.sh verify-dns app.example.com
    ```
 
-For raw `curl` commands, see `references/dns-operations.md`.
+For raw `curl` commands, read `references/dns-operations.md`.
 
 ## Script Reference
 
@@ -87,8 +118,11 @@ Helper script: `scripts/cloudflare-dns.sh`
 
 ## References
 
-- `references/dns-operations.md` — Full curl examples for all record operations
-- `references/kubernetes-integration.md` — External-DNS, cert-manager, AKS config
-- `references/api-reference.md` — Complete Cloudflare DNS API docs
-- `references/azure-integration.md` — Azure-specific patterns
-- [Cloudflare API Docs](https://developers.cloudflare.com/api/)
+Read these on demand when the user's request needs deeper context. Do not load all at once.
+
+| Topic | File | When to read |
+|-------|------|-------------|
+| curl examples for all record ops | `references/dns-operations.md` | User wants raw curl instead of script |
+| Kubernetes External-DNS setup | `references/kubernetes-integration.md` | User mentions k8s, External-DNS, AKS |
+| Complete Cloudflare API docs | `references/api-reference.md` | User needs advanced API features not in script |
+| Azure integration patterns | `references/azure-integration.md` | User mentions Azure, App Service, AKS |
