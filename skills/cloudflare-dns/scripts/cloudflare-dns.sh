@@ -14,11 +14,21 @@
 
 set -euo pipefail
 
-# Auto-load .env from skill directory
+# Auto-load .env — priority: env vars (already set) > project-level .env > skill-level .env
+# Lower-priority files are loaded first; higher-priority values override via `set -a`.
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# 1. Skill-level .env (lowest priority for file-based config)
 if [[ -f "$SKILL_DIR/.env" ]]; then
     set -a
     source "$SKILL_DIR/.env"
+    set +a
+fi
+
+# 2. Project-level .env (overrides skill-level; current working directory)
+if [[ -f "${PWD}/.env" ]] && [[ "${PWD}/.env" != "$SKILL_DIR/.env" ]]; then
+    set -a
+    source "${PWD}/.env"
     set +a
 fi
 
@@ -89,6 +99,24 @@ cf_check_success() {
     echo "$result" | jq -e '.success == true' > /dev/null 2>&1
 }
 
+# Extract error from Cloudflare API response and report with recovery hints
+cf_handle_error() {
+    local result="$1"
+    local operation="$2"
+    local msg code
+    msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+    code=$(echo "$result" | jq -r '.errors[0].code // 0')
+
+    # Detect auth failures (expired/revoked/invalid tokens) and provide re-auth guidance
+    if [[ "$code" == "9109" || "$code" == "6003" || "$code" == "6111" || "$msg" == *"authentication"* || "$msg" == *"Authorization"* ]]; then
+        json_error "auth_failed" "$operation failed: $msg. Token may be expired or revoked. Re-run preflight, then follow First-time Setup to regenerate at https://dash.cloudflare.com/profile/api-tokens" true
+    elif [[ "$code" == "6007" || "$msg" == *"Forbidden"* || "$msg" == *"permission"* ]]; then
+        json_error "permission_denied" "$operation failed: $msg. Token lacks required permissions (Zone:Read + DNS:Edit). Regenerate at https://dash.cloudflare.com/profile/api-tokens" true
+    else
+        json_error "api_error" "$operation failed: $msg" true
+    fi
+}
+
 # ─── Commands ───
 
 cmd_verify_token() {
@@ -105,9 +133,7 @@ cmd_verify_token() {
         zone_count=$(echo "$result" | jq '.result_info.total_count // 0')
         json_ok "{\"token_status\": \"active\", \"accessible_zones\": $zone_count}" "Token is valid ($zone_count zone(s) accessible)"
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "token_invalid" "Token verification failed: $msg" true
+        cf_handle_error "$result" "Token verification"
         exit 1
     fi
 }
@@ -127,9 +153,7 @@ cmd_list_zones() {
             results: [.result[] | {name, id, status}]
         }'
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "api_error" "Failed to list zones: $msg" true
+        cf_handle_error "$result" "List zones"
         exit 1
     fi
 }
@@ -151,9 +175,7 @@ cmd_list_records() {
             results: [.result[] | {type, name, content, proxied, ttl, id}]
         }'
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "api_error" "Failed to list records: $msg" true
+        cf_handle_error "$result" "List records"
         exit 1
     fi
 }
@@ -180,9 +202,7 @@ cmd_get_record() {
             results: [.result[] | {type, name, content, proxied, ttl, id}]
         }'
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "api_error" "Failed to get record: $msg" true
+        cf_handle_error "$result" "Get record"
         exit 1
     fi
 }
@@ -215,9 +235,7 @@ cmd_create_a() {
             record: {id: .result.id, name: .result.name, content: .result.content, proxied: .result.proxied}
         }'
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "create_failed" "Failed to create A record: $msg" true
+        cf_handle_error "$result" "Create A record"
         exit 1
     fi
 }
@@ -250,9 +268,7 @@ cmd_create_cname() {
             record: {id: .result.id, name: .result.name, content: .result.content, proxied: .result.proxied}
         }'
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "create_failed" "Failed to create CNAME record: $msg" true
+        cf_handle_error "$result" "Create CNAME record"
         exit 1
     fi
 }
@@ -273,9 +289,7 @@ cmd_delete_record() {
     if cf_check_success "$result"; then
         json_ok "{\"deleted_id\": \"$record_id\"}" "Record $record_id deleted"
     else
-        local msg
-        msg=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
-        json_error "delete_failed" "Failed to delete record: $msg" true
+        cf_handle_error "$result" "Delete record"
         exit 1
     fi
 }
@@ -383,45 +397,52 @@ cmd_preflight() {
 
     if ! $curl_ok || ! $jq_ok; then ready=false; fi
 
-    # Check credentials
-    local token_status="not_configured" zone_status="not_configured" token_valid=false
+    # Check credentials (live validation — test actual API access, not just env var existence)
+    local token_status="not_configured" zone_status="not_configured" token_valid=false token_hint=""
     if [[ -n "${CF_API_TOKEN:-}" ]]; then
         token_status="configured"
+        token_hint="Token is set but not yet validated"
         if $curl_ok && $jq_ok; then
-            # Test actual capability (list zones) instead of meta-verify endpoint
+            # Test actual capability (list zones with per_page=1) instead of
+            # meta-verify endpoint, because /user/tokens/verify only works for
+            # User-level tokens, not Account-level tokens.
             local verify
             verify=$(curl -s -X GET "${CF_API}/zones?per_page=1" \
                 -H "Authorization: Bearer $CF_API_TOKEN" \
-                -H "Content-Type: application/json" 2>/dev/null)
+                -H "Content-Type: application/json" 2>/dev/null || echo '{"success":false}')
             if echo "$verify" | jq -e '.success == true' &>/dev/null; then
                 token_valid=true
+                token_hint="Token is valid (live API check passed)"
             else
                 ready=false
                 token_status="invalid"
+                local api_msg
+                api_msg=$(echo "$verify" | jq -r '.errors[0].message // "API call failed (network error or malformed token)"' 2>/dev/null)
+                token_hint="Live validation failed: $api_msg. Regenerate at https://dash.cloudflare.com/profile/api-tokens"
             fi
+        else
+            token_hint="Cannot validate — curl or jq missing. Install them first, then re-run preflight."
         fi
     else
         ready=false
+        token_hint="CF_API_TOKEN not set. Create at https://dash.cloudflare.com/profile/api-tokens with Zone:Read + DNS:Edit"
     fi
 
     [[ -n "${CF_ZONE_ID:-}" ]] && zone_status="configured"
 
-    cat <<EOF | jq '.'
-{
-    "ready": $ready,
-    "dependencies": {
-        "curl": {"status": "$(if $curl_ok; then echo ok; else echo missing; fi)", "hint": "brew install curl"},
-        "jq": {"status": "$(if $jq_ok; then echo ok; else echo missing; fi)", "hint": "brew install jq"},
-        "dig": {"status": "$(if $dig_ok; then echo ok; else echo missing; fi)", "hint": "brew install bind (optional, for DNS verification)"},
-        "kubectl": {"status": "$(if $kubectl_ok; then echo ok; else echo missing; fi)", "hint": "brew install kubectl (optional, for External-DNS)"}
-    },
-    "credentials": {
-        "CF_API_TOKEN": {"status": "$token_status", "valid": $token_valid, "required": true, "hint": "Create at https://dash.cloudflare.com/profile/api-tokens with Zone:Read + DNS:Edit"},
-        "CF_ZONE_ID": {"status": "$zone_status", "required": false, "hint": "Find in Cloudflare dashboard → zone overview (right sidebar)"}
-    },
-    "hint": "$(if $ready; then echo 'All checks passed, ready to use'; else echo 'Some checks failed, see details above'; fi)"
-}
+    # Build the JSON output string
+    local output
+    output=$(cat <<EOF
+{"ready":$ready,"dependencies":{"curl":{"status":"$(if $curl_ok; then echo ok; else echo missing; fi)","hint":"brew install curl"},"jq":{"status":"$(if $jq_ok; then echo ok; else echo missing; fi)","hint":"brew install jq"},"dig":{"status":"$(if $dig_ok; then echo ok; else echo missing; fi)","hint":"brew install bind (optional, for DNS verification)"},"kubectl":{"status":"$(if $kubectl_ok; then echo ok; else echo missing; fi)","hint":"brew install kubectl (optional, for External-DNS)"}},"credentials":{"CF_API_TOKEN":{"status":"$token_status","valid":$token_valid,"required":true,"hint":"$token_hint"},"CF_ZONE_ID":{"status":"$zone_status","required":false,"hint":"Find in Cloudflare dashboard - zone overview (right sidebar)"}},"hint":"$(if $ready; then echo 'All checks passed, ready to use'; else echo 'Some checks failed, see details above'; fi)"}
 EOF
+)
+
+    # Pretty-print with jq if available; otherwise output raw JSON (bootstrap-safe)
+    if $jq_ok; then
+        echo "$output" | jq '.'
+    else
+        printf '%s\n' "$output"
+    fi
 
     if ! $ready; then exit 1; fi
 }

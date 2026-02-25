@@ -19,9 +19,10 @@ Determine this SKILL.md directory as `SKILL_DIR`, then use `${SKILL_DIR}/scripts
 
 ## Environment
 
-Credentials are loaded automatically from `.env` at the skill root. The script checks in this order:
-1. Environment variables (already set in shell)
-2. `${SKILL_DIR}/.env` (auto-loaded by script)
+Credentials are loaded automatically from `.env` files. The script checks in this order (highest priority first):
+1. Environment variables (already set in shell — always win)
+2. Project-level `<cwd>/.env` (auto-loaded by script)
+3. Skill-level `${SKILL_DIR}/.env` (auto-loaded by script)
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -46,11 +47,29 @@ A) Project-level: <cwd>/.env (this project only)
 B) User-level: ${SKILL_DIR}/.env (all projects using this skill)
 ```
 
-After the user chooses, write the `.env` file:
+After the user chooses, check if a `.env` already exists at the target location:
+- If it exists: show the current contents, ask the user — **(A) Append** CF_* keys to existing file, **(B) Backup and replace** (`cp .env .env.backup.$(date +%s)`), or **(C) Skip**
+- If it does not exist: copy `.env.example` to `.env`
+
+Then fill in the values:
 ```
 CF_API_TOKEN=<user_input>
 CF_ZONE_ID=<user_input_optional>
 ```
+
+## Preflight Check-Fix Table
+
+When preflight reports `ready: false`, use this table to resolve each failure:
+
+| Check | Status | Fix |
+|-------|--------|-----|
+| `curl` | missing | `brew install curl` (macOS) / `apt install curl` (Linux) |
+| `jq` | missing | `brew install jq` (macOS) / `apt install jq` (Linux) |
+| `dig` | missing | `brew install bind` (macOS) / `apt install dnsutils` (Linux) — optional, only for `verify-dns` |
+| `kubectl` | missing | `brew install kubectl` — optional, only for External-DNS features |
+| `CF_API_TOKEN` | not_configured | Follow First-time Setup above to create and save the token |
+| `CF_API_TOKEN` | invalid | Token exists but live API check failed. Regenerate at https://dash.cloudflare.com/profile/api-tokens with Zone:Read + DNS:Edit permissions |
+| `CF_ZONE_ID` | not_configured | Optional. Find in Cloudflare dashboard: select zone, copy Zone ID from right sidebar |
 
 ## Workflow
 
@@ -58,7 +77,7 @@ CF_ZONE_ID=<user_input_optional>
    ```bash
    bash ${SKILL_DIR}/scripts/cloudflare-dns.sh preflight
    ```
-   If `ready: false`, follow the First-time Setup above.
+   If `ready: false`, consult the Check-Fix Table above for specific remediation.
 2. **List existing records** — Understand current state before changes:
    ```bash
    bash ${SKILL_DIR}/scripts/cloudflare-dns.sh list-records
