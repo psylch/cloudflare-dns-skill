@@ -92,6 +92,39 @@ Helper script: `scripts/cloudflare-dns.sh`
 | `export <zone_id>` | Export zone to BIND format |
 | `verify-dns <hostname>` | Verify DNS resolution |
 
+## Degradation
+
+| Dependency | When missing | Behavior |
+|------------|-------------|----------|
+| `dig` | Not installed | Skip `verify-dns` command; suggest manual check with `nslookup` or online tools like https://dnschecker.org |
+| `kubectl` | Not installed or no cluster access | Skip `check-external-dns`; Kubernetes integration features unavailable — user can still manage DNS records directly via API |
+
+Core DNS record operations (list, create, update, delete) only require `curl` and `jq`.
+
+## Completion Report
+
+After any mutation operation (create, update, delete), present a structured report:
+
+```
+DNS Record Updated!
+
+Zone: [zone name] ([zone_id])
+Operation: [create | update | delete]
+Record: [type] [name] → [content]
+Proxied: [yes | no]
+TTL: [value]
+
+Verification:
+✓ API returned success
+✓ dig @1.1.1.1 [name] [type] → [resolved value]  (if dig available)
+
+Next Steps:
+→ Full propagation may take 1-5 minutes
+→ Verify with: dig @1.1.1.1 [name] [type]
+```
+
+For delete operations, omit the content/proxied/TTL fields and adjust accordingly.
+
 ## Proxy Decision Guide
 
 | Use Case | Proxy (orange cloud) | Reason |
